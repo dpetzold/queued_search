@@ -1,10 +1,16 @@
 from queues import queues
+
+from django.conf import settings
 from django.db import models
+
 from haystack import connections
 from haystack.exceptions import NotHandled
 from haystack.signals import BaseSignalProcessor
 from haystack.utils import default_get_identifier
+
 from queued_search.utils import get_queue_name, rec_getattr
+
+SKIP_NOINDEX = getattr(settings, 'SEARCH_QUEUE_SKIP_NOINDEX', True)
 
 
 class QueuedSignalProcessor(BaseSignalProcessor):
@@ -17,23 +23,26 @@ class QueuedSignalProcessor(BaseSignalProcessor):
         models.signals.post_delete.disconnect(self.enqueue_delete)
 
     def enqueue_save(self, sender, instance, **kwargs):
-        try:
-            filter_fields = instance.queue_filter()
-        except AttributeError:
-            filter_fields = {}
-        # Make sure filter fields are all set to acceptable value, otherwise delete
-        for filter_field, filter_values in filter_fields.items():
-            if rec_getattr(instance, filter_field) not in filter_values:
-                return self.enqueue('delete', instance)
 
-        try:
-            exclude_fields = instance.queue_exclude()
-        except AttributeError:
-            exclude_fields = {}
-        # Make sure exclude fields are not set to unacceptable value, otherwise delete
-        for exclude_field, exclude_values in exclude_fields.items():
-            if rec_getattr(instance, exclude_field) in exclude_values:
-                return self.enqueue('delete', instance)
+        if SKIP_NOINDEX:
+            try:
+                filter_fields = instance.queue_filter()
+            except AttributeError:
+                filter_fields = {}
+            # Make sure filter fields are all set to acceptable value, otherwise delete
+            for filter_field, filter_values in filter_fields.items():
+                if rec_getattr(instance, filter_field) not in filter_values:
+                    return self.enqueue('delete', instance)
+
+            try:
+                exclude_fields = instance.queue_exclude()
+            except AttributeError:
+                exclude_fields = {}
+
+            # Make sure exclude fields are not set to unacceptable value, otherwise delete
+            for exclude_field, exclude_values in exclude_fields.items():
+                if rec_getattr(instance, exclude_field) in exclude_values:
+                    return self.enqueue('delete', instance)
 
         return self.enqueue('update', instance)
 
@@ -50,13 +59,13 @@ class QueuedSignalProcessor(BaseSignalProcessor):
             # ...or...
             ``delete:weblog.entry.8``
         """
-        
-        """But first check if the model even has a ``SearchIndex`` implementation."""
-        try:
-            connections['default'].get_unified_index().get_index(instance.__class__)
-        except NotHandled:
-            return False
-        
+        if SKIP_NOINDEX:
+            # But first check if the model even has a ``SearchIndex`` implementation.
+            try:
+                connections['default'].get_unified_index().get_index(instance.__class__)
+            except NotHandled:
+                return False
+
         message = "%s:%s" % (action, default_get_identifier(instance))
         queue = queues.Queue(get_queue_name())
         return queue.write(message)
