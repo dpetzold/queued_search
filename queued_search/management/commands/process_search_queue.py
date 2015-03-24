@@ -21,12 +21,14 @@ from queued_search.utils import get_queue_name
 
 DEFAULT_BATCH_SIZE = None
 LOG_LEVEL = getattr(settings, 'SEARCH_QUEUE_LOG_LEVEL', logging.ERROR)
+RETRY_ATTEMPTS = getattr(settings, 'SEARCH_QUEUE_RETRY_ATTEMPTS', 5)
+RETRY_TTL = getattr(settings, 'SEARCH_QUEUE_RETRY_TTL', 300)  # 5 minutes
 
 logging.basicConfig(
     level=LOG_LEVEL
 )
 
-redis_client = redis.Redis(
+redis_client = redis.StrictRedis(
     host=settings.REDIS_HOST,
     port=settings.REDIS_PORT,
     db=settings.REDIS_DB,
@@ -121,29 +123,27 @@ class Command(NoArgsCommand):
 
         self.log.info('Requeued %d updates and %d deletes.' % (update_count, delete_count))
 
-    def requeue_object(self, message, error_message):
+    def requeue_object(self, object_id, error_message):
 
-        requeue_message = 'requeued_%s' % (message)
+        requeue_cmd = 'requeued_{}'.format(object_id)
 
-        if redis_client.exists(requeue_message):
-            count = int(redis_client[requeue_message]) + 1
-            redis_client[requeue_message] = count
-            if count > 5:
+        if redis_client.exists(requeue_cmd):
+            count = redis_client.incr(requeue_cmd)
+            if count > RETRY_ATTEMPTS:
                 self.log.info('Message from process_search_queue', extra={
-                    'action': 'Requeued {} {}x stopping retry'.format(message, count),
+                    'action': 'Requeued {} {}x stopping retry'.format(object_id, count),
                     'error': error_message,
                 })
-                del redis_client[requeue_message]
+                redis_client.delete(object_id)
                 return
         else:
             count = 1
-            redis_client[requeue_message] = count
-            redis_client.expire(requeue_message, 60 * 5)
+            redis_client.setex(requeue_cmd, RETRY_TTL, count)
 
         self.log.info('Message from process_search_queue', extra={
             'error': '{}: requeued {} times'.format(error_message, count),
         })
-        self.queue.write(message)
+        self.queue.write(object_id)
 
     def process_message(self, message):
         """
